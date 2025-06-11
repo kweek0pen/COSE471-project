@@ -1,236 +1,304 @@
+# Complete pipeline: DataLoader, 8-fold CV, CLIP fusion model, training, Grad-CAM & embedding visualization
+
+"""
+Dependencies:
+  - torch, torchvision, clip (OpenAI CLIP)
+  - numpy, pandas, scikit-learn, matplotlib, pillow
+"""
+
 import os
-import random
 import numpy as np
+import pandas as pd
+from pathlib import Path
 from PIL import Image
 import torch
+import clip
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import StratifiedKFold
 import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import transforms, models, datasets
-from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
+import torch.optim as optim
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
 
-# ----------------------------
-# 1. Configuration & Helpers
-# ----------------------------
-DATA_DIR = "StimulusImages"
-BATCH_SIZE = 16
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
+# 1) Configuration
+root_dir = Path('drive/MyDrive/Colab Notebooks/datas/Stimulus Images')   # 수정: 실제 데이터 경로
+n_splits = 8
+batch_size = 16
+num_epochs = 5
+learning_rate = 1e-4
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def sup_contrastive_loss(features, labels, temperature=0.07):
-    """
-    Supervised contrastive loss (Khosla et al. 2020).
-    features: Tensor of shape (2N, D), normalized
-    labels:   Tensor of shape (2N,)
-    """
-    device = features.device
-    labels = labels.view(-1, 1)
-    mask = torch.eq(labels, labels.T).float().to(device)
-    logits = torch.matmul(features, features.T) / temperature
-    logits_mask = torch.ones_like(mask) - torch.eye(labels.size(0), device=device)
-    mask = mask * logits_mask
-    exp_logits = torch.exp(logits) * logits_mask
-    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
-    mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
-    loss = -mean_log_prob_pos.mean()
-    return loss
+# 2) Build DataFrame of image paths, categories, labels
+records = []
+for label_dir in root_dir.iterdir():
+    if label_dir.is_dir():
+        label = 1 if label_dir.name.lower() == "vme" else 0
+        for img_path in label_dir.glob("*.jpg"):
+            # 예: 'Apple_Original.jpg' → 'Apple'
+            category = img_path.stem.split('_')[0]
+            records.append({
+                'path': str(img_path),
+                'category': category,
+                'label': label
+            })
+df = pd.DataFrame(records)
 
-# ----------------------------
-# 2. Data & Augmentations
-# ----------------------------
-contrastive_transforms = transforms.Compose([
-    transforms.RandomResizedCrop(224, scale=(0.9, 1.0)),
-    transforms.RandomApply([transforms.ColorJitter(0.4,0.4,0.4,0.1)], p=0.8),
-    transforms.RandomGrayscale(p=0.2),
-    transforms.GaussianBlur(kernel_size=3),
+# 3) Transforms
+train_tf = transforms.Compose([
+    transforms.RandomResizedCrop(224),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(0.2,0.2,0.2,0.1),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485,0.456,0.406],
-                         std=[0.229,0.224,0.225]),
+    transforms.Normalize((0.4815,0.4578,0.4082),(0.2686,0.2613,0.2758))
 ])
-
-classifier_transforms = transforms.Compose([
+val_tf = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485,0.456,0.406],
-                         std=[0.229,0.224,0.225]),
+    transforms.Normalize((0.4815,0.4578,0.4082),(0.2686,0.2613,0.2758))
 ])
 
-class ContrastiveDataset(Dataset):
-    def __init__(self, root_dir):
-        self.dataset = datasets.ImageFolder(root_dir, transform=contrastive_transforms)
-    def __len__(self):
-        return len(self.dataset)
+# 4) Dataset
+class VMEDataset(Dataset):
+    def __init__(self, df, transform):
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+    def __len__(self): return len(self.df)
     def __getitem__(self, idx):
-        img, label = self.dataset[idx]
-        img2, _ = self.dataset[idx]  # second augmented view
-        return img, img2, label
+        row = self.df.iloc[idx]
+        img = Image.open(row.path).convert('RGB')
+        img = self.transform(img)
+        label = torch.tensor(row.label, dtype=torch.float32)
+        cat = row.category
+        return img, label, cat
 
-class SimpleDataset(Dataset):
-    def __init__(self, root_dir):
-        self.dataset = datasets.ImageFolder(root_dir, transform=classifier_transforms)
-    def __len__(self):
-        return len(self.dataset)
-    def __getitem__(self, idx):
-        return self.dataset[idx]
+skf = StratifiedKFold(n_splits=8, shuffle=True, random_state=42)
 
-# ----------------------------
-# 3. Model Definitions
-# ----------------------------
-class FrozenEncoder(nn.Module):
-    def __init__(self):
+for fold, (train_idx, val_idx) in enumerate(
+        skf.split(df, df['label']), start=1):
+
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df   = df.iloc[val_idx].reset_index(drop=True)
+
+    train_ds = VMEDataset(train_df, train_tf)
+    val_ds   = VMEDataset(val_df,   val_tf)
+
+    train_loader = DataLoader(train_ds, batch_size=16,
+                              shuffle=True,  num_workers=4)
+    val_loader   = DataLoader(val_ds,   batch_size=16,
+                              shuffle=False, num_workers=4)
+
+    # 폴드별 데이터 분포 확인
+    print(f"--- Fold {fold} ---")
+    print("Train labels:", train_df.label.value_counts().to_dict())
+    print("Val   labels:",   val_df.label.value_counts().to_dict())
+
+# 5) Prompt maker
+def make_prompt(cat):
+    return f"A clear icon of {cat}."
+
+# 6) Model definition
+class CLIPFusionClassifier(nn.Module):
+    def __init__(self, clip_model, hidden_dim=256):
         super().__init__()
-        resnet = models.resnet50(pretrained=True)
-        modules = list(resnet.children())[:-1]  # drop final FC layer
-        self.encoder = nn.Sequential(*modules)
-        for p in self.encoder.parameters():
-            p.requires_grad = False
-    def forward(self, x):
-        x = self.encoder(x)        # (N, 2048, 1, 1)
-        return x.view(x.size(0), -1)  # (N, 2048)
+        self.clip = clip_model
+        # RN50’s visual encoder produces a 1024-dim embedding:
+        embed_dim = clip_model.visual.output_dim  
 
-class ProjectionHead(nn.Module):
-    def __init__(self, in_dim=2048, hidden_dim=512, proj_dim=128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+        # now use that dynamically instead of “512”
+        self.img_proj = nn.Linear(embed_dim, embed_dim)
+        self.txt_proj = nn.Linear(embed_dim, embed_dim)
+        self.fuse     = nn.Sequential(
+            nn.Linear(embed_dim*2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, proj_dim),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 1)
         )
-    def forward(self, x):
-        return F.normalize(self.net(x), dim=1)
 
-class ClassifierHead(nn.Module):
-    def __init__(self, in_dim=2048):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(128, 1),
-            nn.Sigmoid(),
-        )
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, images, text_tokens):
+        img_emb = self.clip.encode_image(images).float()
+        txt_emb = self.clip.encode_text(text_tokens).float()
 
-# ----------------------------
-# 4. Training Functions
-# ----------------------------
-def train_contrastive(encoder, projector, loader, optimizer, epochs=10):
-    encoder.train()
-    projector.train()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for x1, x2, labels in tqdm(loader, desc=f"Contrastive Epoch {epoch+1}/{epochs}"):
-            x1, x2, labels = x1.to(DEVICE), x2.to(DEVICE), labels.to(DEVICE)
-            h1, h2 = encoder(x1), encoder(x2)
-            z1, z2 = projector(h1), projector(h2)
-            feats = torch.cat([z1, z2], dim=0)
-            labs = torch.cat([labels, labels], dim=0)
-            loss = sup_contrastive_loss(feats, labs)
-            optimizer.zero_grad()
-            loss.backward()
+        # both encode_image and encode_text return (B, embed_dim)
+        img_emb = self.img_proj(img_emb)
+        txt_emb = self.txt_proj(txt_emb)
+        fused   = torch.cat([img_emb, txt_emb], dim=-1)   # (B, 2*embed_dim)
+        logits  = self.fuse(fused).squeeze(-1)             # (B,)
+        return fused, logits
+
+# 7) Load CLIP and instantiate model
+clip_model, preprocess = clip.load("RN50", device=device)
+model = CLIPFusionClassifier(clip_model).to(device)
+# Freeze CLIP
+for p in model.clip.parameters(): p.requires_grad = False
+optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
+criterion = nn.BCEWithLogitsLoss()
+
+# 8) Cross-validation training
+"""skf = StratifiedKFold(n_splits=8, shuffle=True, random_state=42)
+
+    for f, (train_idx, val_idx) in enumerate(
+        skf.split(df, df['label']), start=1):
+
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df   = df.iloc[val_idx].reset_index(drop=True)
+
+    train_ds = VMEDataset(train_df, train_tf)
+    val_ds   = VMEDataset(val_df,   val_tf)
+
+    train_loader = DataLoader(train_ds, batch_size=16,
+                              shuffle=True,  num_workers=4)
+    val_loader   = DataLoader(val_ds,   batch_size=16,
+                              shuffle=False, num_workers=4)
+
+    # 폴드별 데이터 분포 확인
+    print(f"--- Fold {f} ---")
+    print("Train labels:", train_df.label.value_counts().to_dict())
+    print("Val   labels:",   val_df.label.value_counts().to_dict())"""
+
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+fold_metrics = []
+for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['label']), start=1):
+    print(f"=== Fold {fold}/{n_splits} ===")
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df   = df.iloc[val_idx].reset_index(drop=True)
+
+    train_ds = VMEDataset(train_df, train_tf)
+    val_ds   = VMEDataset(val_df, val_tf)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    # Train epochs
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        for imgs, labels, cats in train_loader:
+            imgs = imgs.to(device)
+            labels = labels.to(device)
+            tokens = clip.tokenize([make_prompt(c) for c in cats]).to(device)
+
+            _, logits = model(imgs, tokens)
+            loss = criterion(logits, labels)
+            running_loss += loss.item() * imgs.size(0)
+
+            optimizer.zero_grad() 
+            loss.backward() 
             optimizer.step()
-            total_loss += loss.item()
-        print(f"Epoch {epoch+1}: loss {total_loss/len(loader):.4f}")
+        epoch_loss = running_loss / len(train_ds)
+        print(f" Epoch {epoch+1}/{num_epochs} – Train Loss: {epoch_loss:.4f}")
 
-def train_classifier(encoder, classifier, loader, optimizer, epochs=5):
-    encoder.eval()
-    classifier.train()
-    criterion = nn.BCELoss()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for imgs, labels in tqdm(loader, desc=f"CLS Epoch {epoch+1}/{epochs}"):
-            imgs = imgs.to(DEVICE)
-            labels = labels.to(DEVICE).float().unsqueeze(1)
-            with torch.no_grad():
-                feats = encoder(imgs)
-            preds = classifier(feats)
-            loss = criterion(preds, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        print(f"Epoch {epoch+1}: loss {total_loss/len(loader):.4f}")
-
-# ----------------------------
-# 5. Main Pipeline
-# ----------------------------
-def pca_torch(X, n_components):
-    """
-    PCA via SVD on torch.Tensor.
-    Returns: (X_reduced, components)
-    """
-    X_centered = X - X.mean(dim=0)
-    U, S, Vt = torch.linalg.svd(X_centered, full_matrices=False)
-    comps = Vt[:n_components]
-    X_red = X_centered @ comps.T
-    return X_red, comps
-
-def main():
-    # 5.1 Contrastive fine-tuning
-    ds_con = ContrastiveDataset(DATA_DIR)
-    loader_con = DataLoader(ds_con, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    encoder = FrozenEncoder().to(DEVICE)
-    projector = ProjectionHead().to(DEVICE)
-    opt_con = torch.optim.AdamW(
-        list(projector.parameters()) + list(encoder.encoder[-1].parameters()),
-        lr=1e-5
-    )
-    train_contrastive(encoder, projector, loader_con, opt_con, epochs=20)
-
-    # 5.2 Train MLP head
-    ds_clf = SimpleDataset(DATA_DIR)
-    loader_clf = DataLoader(ds_clf, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    classifier = ClassifierHead().to(DEVICE)
-    opt_clf = torch.optim.AdamW(classifier.parameters(), lr=1e-4)
-    train_classifier(encoder, classifier, loader_clf, opt_clf, epochs=10)
-
-    # 5.3 Extract embeddings & logistic regression on PCA features
-    encoder.eval()
-    feats_list, labels_list = [], []
-    for img, label in loader_clf:
-        with torch.no_grad():
-            z = encoder(img.to(DEVICE)).cpu()
-        feats_list.append(z)
-        labels_list.append(label)
-    X = torch.vstack(feats_list)
-    y = torch.tensor(torch.cat(labels_list), dtype=torch.float32).unsqueeze(1)
-
-    # PCA to 50 dims
-    X_pca, _ = pca_torch(X, n_components=50)
-
-    # Train torch-based logistic regression
-    class LogRegTorch(nn.Module):
-        def __init__(self, in_dim):
-            super().__init__()
-            self.linear = nn.Linear(in_dim, 1)
-        def forward(self, x):
-            return torch.sigmoid(self.linear(x))
-
-    logreg = LogRegTorch(in_dim=50).to(DEVICE)
-    opt_lr = torch.optim.AdamW(logreg.parameters(), lr=1e-3)
-    criterion = nn.BCELoss()
-    for epoch in range(100):
-        logreg.train()
-        opt_lr.zero_grad()
-        preds = logreg(X_pca.to(DEVICE))
-        loss = criterion(preds, y.to(DEVICE))
-        loss.backward()
-        opt_lr.step()
-        if epoch % 10 == 0:
-            print(f"LogReg Epoch {epoch}: loss {loss.item():.4f}")
-
-    # Final accuracy
-    logreg.eval()
+    # Validation
+    model.eval()
+    ys, ps, preds = [], [], []
     with torch.no_grad():
-        probs = logreg(X_pca.to(DEVICE)).cpu().numpy()
-    preds = (probs > 0.5).astype(int)
-    acc = (preds.flatten() == y.numpy().flatten()).mean()
-    print(f"Logistic Regression accuracy on PCA features: {acc:.3f}")
+        for imgs, labels, cats in val_loader:
+            imgs=imgs.to(device)
+            labels=labels.to(device)
+            tokens=clip.tokenize([make_prompt(c) for c in cats]).to(device)
 
-if __name__ == "__main__":
-    main()
+            _, logits=model(imgs, tokens)
+            probs = torch.sigmoid(logits)
+
+            ys.extend(labels.cpu().numpy())
+            ps.extend(probs.cpu().numpy())
+            preds.extend((probs.cpu().numpy() >= 0.5).astype(int))
+
+    auc = roc_auc_score(ys, ps)
+    preds = (np.array(ps)>=0.5).astype(int)
+    f1 = f1_score(ys, preds)
+    acc  = accuracy_score(ys, preds)
+    print(f"Fold {fold+1} AUC: {auc:.3f}, F1: {f1:.3f}, Accuracy: {acc:.3f}")
+    fold_metrics.append((auc, f1))
+
+
+"""
+# 9) Grad-CAM visualization for a sample
+# Pick first val sample
+sample_img, _, sample_cat = val_ds[0]
+orig = Image.open(val_df.iloc[0].path).convert('RGB').resize((224,224))
+orig_np = np.array(orig)/255.0
+img_tensor = sample_img.unsqueeze(0).to(device)
+text_token = clip.tokenize([make_prompt(sample_cat)]).to(device)
+
+# Hook for last conv of RN50
+# Setup hooks
+gradients = []
+activations = []
+
+def forward_hook(module, input, output):
+    activations.append(output)
+
+def backward_hook(module, grad_input, grad_output):
+    gradients.append(grad_output[0])
+
+# Hook to the last residual block
+target_layer = model.clip.visual.layer4[-1]
+target_layer.register_forward_hook(forward_hook)
+target_layer.register_full_backward_hook(backward_hook)
+
+# Get one sample from val_ds
+sample_img, _, sample_cat = val_ds[0]
+img_tensor = sample_img.unsqueeze(0).to(device)
+text_token = clip.tokenize([make_prompt(sample_cat)]).to(device)
+
+# Forward + backward pass
+model.zero_grad()
+_, logits = model(img_tensor, text_token)
+logit = logits[0]
+logit.backward()
+
+# Now hooks should have fired
+if not gradients or not activations:
+    raise RuntimeError("Grad-CAM hooks did not capture any gradients/activations.")
+
+grad = gradients[0][0].cpu().numpy()
+act  = activations[0][0].cpu().numpy()
+weights = np.mean(grad, axis=(1, 2))
+cam = np.sum(weights[:, None, None] * act, axis=0)
+cam = np.maximum(cam, 0)
+cam /= cam.max()
+
+
+# Plot Grad-CAM
+plt.figure(figsize=(5,5))
+plt.imshow(orig_np)
+plt.imshow(cam, cmap='jet', alpha=0.5)
+plt.title(f"Grad-CAM: {sample_cat}")
+plt.axis('off')"""
+
+# 10) Embedding extraction and PCA/t-SNE
+all_emb, all_lbl = [], []
+full_ds = VMEDataset(df, val_tf)
+full_loader = DataLoader(full_ds, batch_size=32, shuffle=False)
+with torch.no_grad():
+    for imgs, labels, cats in full_loader:
+        imgs = imgs.to(device)
+        tokens = clip.tokenize([make_prompt(c) for c in cats]).to(device)
+        fused, _ = model(imgs, tokens)
+        all_emb.append(fused.cpu().numpy()); all_lbl.extend(labels.numpy())
+emb = np.concatenate(all_emb)
+# PCA
+pca = PCA(n_components=2).fit_transform(emb)
+# t-SNE
+tsne = TSNE(n_components=2, perplexity=30).fit_transform(emb)
+
+# Plot embeddings
+plt.figure(figsize=(6,5))
+for lbl,marker,col in [(0,'o','blue'),(1,'^','red')]:
+    idx = np.array(all_lbl)==lbl
+    plt.scatter(pca[idx,0], pca[idx,1], marker=marker, c=col, label=f"VME={lbl}", alpha=0.6)
+plt.title("PCA Embedding")
+plt.legend()
+plt.show()
+
+plt.figure(figsize=(6,5))
+for lbl,marker,col in [(0,'o','blue'),(1,'^','red')]:
+    idx = np.array(all_lbl)==lbl
+    plt.scatter(tsne[idx,0], tsne[idx,1], marker=marker, c=col, label=f"VME={lbl}", alpha=0.6)
+plt.title("t-SNE Embedding")
+plt.legend()
+plt.show()
